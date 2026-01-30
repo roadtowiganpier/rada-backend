@@ -34,3 +34,33 @@ class StateOfCharge(Base):
     timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
 
     battery = relationship("Battery", back_populates="state_of_charge_records")
+
+class GridSignal (Base):
+    __tablename__ = "grid_signals"
+
+    id = Column(Integer, primary_key=True, index=True)
+    timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+    frequency_hz = Column(Float, nullable=False)
+    voltage_kv = Column(Float, nullable=False)
+    status = Column(String(50), nullable=False)
+
+class DispatchCommand (Base):
+    __tablename__ = "dispatch_commands"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+    battery_id = Column(Integer, ForeignKey("batteries.id"), nullable=False)
+    command_type = Column(String(50), nullable=False)
+    power_target_kw = Column(Float, nullable=False)
+    duration_seconds = Column(Integer, nullable=False)
+
+
+class BatteryTelemetry (Base):
+    __tablename__ = "battery_telemetry"
+
+    id = Column(Integer, primary_key=True, index=True)
+    timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+    battery_id = Column(Integer, ForeignKey("batteries.id"), nullable=False)
+    state_of_charge_percent = Column(Float, nullable=False) 
+    current_power_kw = Column(Float, nullable=False)  
+    status = Column(String(50), nullable=False)
