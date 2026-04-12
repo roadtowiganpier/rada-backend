@@ -35,15 +35,22 @@ class StateOfCharge(Base):
 
     battery = relationship("Battery", back_populates="state_of_charge_records")
 
-class GridSignal (Base):
+class GridSignal(Base):
     __tablename__ = "grid_signals"
-
-    id = Column(Integer, primary_key=True, index=True)
-    timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
-    frequency_hz = Column(Float, nullable=False)
-    voltage_kv = Column(Float, nullable=False)
-    status = Column(String(50), nullable=False)
-
+    id                  = Column(Integer, primary_key=True, index=True)
+    timestamp           = Column(DateTime, default=lambda: datetime.now(timezone.utc), index=True)
+    # From Actual Generation API
+    total_generation_mw = Column(Float, nullable=True)
+    renewable_mw        = Column(Float, nullable=True)
+    renewable_pct       = Column(Float, nullable=True)
+    # From Balancing API
+    imbalance_mw        = Column(Float, nullable=True)
+    imbalance_trend     = Column(String(20), nullable=True)  # "upward" or "downward"
+    fcr_activated_mw    = Column(Float, nullable=True)
+    # Calculated — derived from imbalance, not a real measurement
+    calculated_frequency_hz = Column(Float, nullable=True)
+    status              = Column(String(50), nullable=False)
+    
 class DispatchCommand (Base):
     __tablename__ = "dispatch_commands"
     

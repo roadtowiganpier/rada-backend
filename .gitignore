@@ -6,4 +6,4 @@ __pycache__/
 bess.db
 .claude/
 *.gitignore~
-*~
+*~git.env

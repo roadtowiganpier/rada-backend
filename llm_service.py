@@ -50,7 +50,7 @@ def ask_bess_question_stream(question: str):
 
     # First call — let Mistral decide if it needs to use a tool
     response = ollama.chat(
-        model="mistral",
+        model="mistral:7b-instruct-q8_0",
         messages=messages,
         tools=[BATTERY_TOOL]
     )
@@ -70,7 +70,7 @@ def ask_bess_question_stream(question: str):
 
     # Final call — now stream the answer
     stream = ollama.chat(
-        model="mistral",
+        model="mistral:7b-instruct-q8_0",
         messages=messages,
         stream=True
     )
