@@ -1,24 +1,10 @@
 import ollama
 from database import SessionLocal
 from models import Battery
-import json
 
-# --- Tool definition for Ollama ---
-BATTERY_TOOL = {
-    "type": "function",
-    "function": {
-        "name": "get_all_batteries",
-        "description": "Query the batteries table in the BESS database and return all battery records including id, name, capacity_kwh, max_charge_rate_kw, and is_active.",
-        "parameters": {
-            "type": "object",
-            "properties": {},
-            "required": []
-        }
-    }
-}
 
-def execute_battery_query() -> str:
-    """Run the actual SQL via SQLAlchemy and return results as a string."""
+def fetch_battery_context() -> str:
+    """Fetch all battery records from the DB and format as a string for the system prompt."""
     db = SessionLocal()
     try:
         batteries = db.query(Battery).all()
@@ -34,43 +20,35 @@ def execute_battery_query() -> str:
     finally:
         db.close()
 
+
 def ask_bess_question_stream(question: str):
-    """Generator that streams tokens back to FastAPI."""
+    """
+    Single-pass generator that streams tokens back to FastAPI.
+
+    Battery data is always fetched from the DB and injected into the system
+    prompt — no tool-calling round trip, so inference runs once only.
+    """
+    battery_data = fetch_battery_context()
+
     messages = [
         {
             "role": "system",
             "content": (
                 "You are a BESS (Battery Energy Storage System) expert assistant. "
-                "You have access to a live database of battery assets. "
-                "Use the get_all_batteries tool when the user asks about batteries in the system."
+                "You have access to the following live battery data from the system database:\n\n"
+                f"{battery_data}\n\n"
+                "Use this data when answering questions about the batteries in the system. "
+                "For general BESS questions not related to the database, answer from your expert knowledge."
             )
         },
-        {"role": "user", "content": question}
+        {
+            "role": "user",
+            "content": question
+        }
     ]
 
-    # First call — let Mistral decide if it needs to use a tool
-    response = ollama.chat(
-        model="mistral:7b-instruct-q8_0",
-        messages=messages,
-        tools=[BATTERY_TOOL]
-    )
-
-    # Check if Mistral wants to call our SQL tool
-    if response.message.tool_calls:
-        for tool_call in response.message.tool_calls:
-            if tool_call.function.name == "get_all_batteries":
-                tool_result = execute_battery_query()
-
-                # Append the tool interaction to the message history
-                messages.append(response.message)
-                messages.append({
-                    "role": "tool",
-                    "content": tool_result
-                })
-
-    # Final call — now stream the answer
     stream = ollama.chat(
-        model="mistral:7b-instruct-q8_0",
+        model="mistral:7b-instruct",
         messages=messages,
         stream=True
     )
