@@ -1,6 +1,7 @@
 from fastapi import FastAPI, Depends
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from database import engine, SessionLocal
 from models import Base, Battery
 from llm_service import ask_bess_question_stream
@@ -34,9 +35,9 @@ def get_batteries(db: Session = Depends(get_db)):
             "capacity_kwh": b.capacity_kwh,
             "max_charge_rate_kw": b.max_charge_rate_kw,
             "is_active": b.is_active
-        }
-        for b in batteries
-    ]
+         }
+            for b in batteries
+        ]
 
 @app.post("/llm/ask")
 def ask_llm(question: str):
