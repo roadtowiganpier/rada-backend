@@ -44,3 +44,17 @@ def ask_llm(question: str):
         ask_bess_question_stream(question),
         media_type="text/plain"
     )
+
+@app.get("/batteries/summary")
+def get_battery_summary(db: Session = Depends(get_db)):
+    count, total_capacity, total_discharge = db.query(
+        func.count(Battery.id),
+        func.sum(Battery.capacity_kwh),
+        func.sum(Battery.max_discharge_rate_kw)
+    ).filter(Battery.is_active == True).one()
+    
+    return {
+        "active_battery_count": count,
+        "total_capacity_kwh": total_capacity,
+        "total_max_discharge_rate_kw": total_discharge
+    }
