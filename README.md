@@ -1,6 +1,8 @@
-# BESS Grid Manager
+# Renewable Asset Grid Manager
 
-A battery energy storage system monitoring and AI analysis platform built with FastAPI, SQLAlchemy, and Mistral via Ollama. The application exposes a REST API for querying BESS fleet data and accepts natural language questions about battery status, which are answered by a locally-running LLM with live access to the database.
+A renewable energy system monitoring (Solar PV, Wind, BESS - Battery Energy Storage Systems)  and AI analysis platform built with FastAPI, SQLAlchemy, and Mistral via Ollama. The application exposes a REST API for querying BESS fleet data and accepts natural language questions about battery status, which are answered by a locally-running LLM with live access to the database.
+
+A front end application for this project is developed by Candyfair and is also available as a repository here. 
 
 ---
 
