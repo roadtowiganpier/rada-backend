@@ -1,8 +1,10 @@
-from fastapi import FastAPI, Depends
+from fastapi import FastAPI, Depends, Query, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import func
+from typing import Optional
+from datetime import datetime
 from database import engine, SessionLocal
 from models import Base, Asset, AssetType, StateOfCharge
 from llm_service import ask_grid_question_stream
@@ -143,10 +145,108 @@ def get_asset_summary(db: Session = Depends(get_db)):
     }
 
 
+from typing import Optional
 
+@app.get("/assets/{asset_id}/soc")
+def get_asset_soc(
+    asset_id: int,
+    mode: str = Query(..., description="S for summary (latest record), D for detail (history)"),
+    from_ts: Optional[str] = Query(None, description="ISO datetime start e.g. 2026-04-25T00:00:00"),
+    to_ts: Optional[str] = Query(None, description="ISO datetime end e.g. 2026-05-02T23:59:59"),
+    limit: int = Query(288, description="Max records in D mode — default 288 = 24hrs at 10min intervals"),
+    db: Session = Depends(get_db)
+):
+    # Verify asset exists
+    asset = db.query(Asset).filter(Asset.id == asset_id).first()
+    if not asset:
+        raise HTTPException(status_code=404, detail=f"Asset {asset_id} not found")
 
+    if mode.upper() == "S":
+        record = (
+            db.query(StateOfCharge)
+            .filter(StateOfCharge.asset_id == asset_id)
+            .order_by(StateOfCharge.timestamp.desc())
+            .first()
+        )
+        if not record:
+            raise HTTPException(status_code=404, detail=f"No state of charge records found for asset {asset_id}")
 
+        return {
+            "asset_id":         asset.id,
+            "asset_name":       asset.name,
+            "eic_code":         asset.eic_code,
+            "asset_type":       asset.asset_type.value,
+            "max_capacity_mwh": asset.max_capacity_mwh,
+            "record": {
+                "timestamp":           record.timestamp.isoformat(),
+                "operational_mode":    record.operational_mode.value if record.operational_mode else None,
+                "asset_status":        record.asset_status.value if record.asset_status else None,
+                "energy_mwh":          record.energy_mwh,
+                "power_mw":            record.power_mw,
+                "reactive_power_mvar": record.reactive_power_mvar,
+                "power_factor":        record.power_factor,
+                "voltage":             record.voltage,
+                "current_amps":        record.current_amps,
+                "temperature_celsius": record.temperature_celsius,
+            }
+        }
 
+    elif mode.upper() == "D":
+        query = (
+            db.query(StateOfCharge)
+            .filter(StateOfCharge.asset_id == asset_id)
+        )
+
+        if from_ts:
+            try:
+                query = query.filter(StateOfCharge.timestamp >= datetime.fromisoformat(from_ts))
+            except ValueError:
+                raise HTTPException(status_code=400, detail="from_ts is not a valid ISO datetime")
+
+        if to_ts:
+            try:
+                query = query.filter(StateOfCharge.timestamp <= datetime.fromisoformat(to_ts))
+            except ValueError:
+                raise HTTPException(status_code=400, detail="to_ts is not a valid ISO datetime")
+
+        records = (
+            query
+            .order_by(StateOfCharge.timestamp.asc())
+            .limit(limit)
+            .all()
+        )
+
+        if not records:
+            raise HTTPException(status_code=404, detail=f"No state of charge records found for asset {asset_id}")
+
+        return {
+            "asset_id":         asset.id,
+            "asset_name":       asset.name,
+            "eic_code":         asset.eic_code,
+            "asset_type":       asset.asset_type.value,
+            "max_capacity_mwh": asset.max_capacity_mwh,
+            "record_count":     len(records),
+            "from_ts":          records[0].timestamp.isoformat(),
+            "to_ts":            records[-1].timestamp.isoformat(),
+            "records": [
+                {
+                    "timestamp":           r.timestamp.isoformat(),
+                    "operational_mode":    r.operational_mode.value if r.operational_mode else None,
+                    "asset_status":        r.asset_status.value if r.asset_status else None,
+                    "energy_mwh":          r.energy_mwh,
+                    "power_mw":            r.power_mw,
+                    "reactive_power_mvar": r.reactive_power_mvar,
+                    "power_factor":        r.power_factor,
+                    "voltage":             r.voltage,
+                    "current_amps":        r.current_amps,
+                    "temperature_celsius": r.temperature_celsius,
+                }
+                for r in records
+            ]
+        }
+
+    else:
+        raise HTTPException(status_code=400, detail="mode must be S (summary) or D (detail)")
 
 @app.post("/llm/ask")
 def ask_llm(question: str):
