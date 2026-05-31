@@ -66,21 +66,11 @@ def wind_factor(hour: float) -> float:
 # ---------------------------------------------------------------------------
 
 def derive_operational_mode(asset_type: str, power_mw: float, hour: float) -> str:
-    """
-    Derive a realistic operational mode from asset type, power direction,
-    and time of day.
-
-      BATTERY:  charging → holding overnight low-load window → discharging
-      SOLAR:    curtailed when irradiance is near zero, active otherwise
-      WIND:     curtailed at very low output, active otherwise
-    """
     if asset_type == "battery":
-        if power_mw < -0.01:
-            return "active"    # charging
-        elif power_mw > 0.01:
-            return "active"    # discharging
+        if power_mw < -0.5 or power_mw > 0.5:
+            return "active"
         else:
-            return "curtailed"   # standing by between charge/discharge transitions
+            return "holding"
     elif asset_type == "solar":
         return "curtailed" if solar_factor(hour) < 0.05 else "active"
     else:  # wind
@@ -161,12 +151,19 @@ def next_telemetry(asset: dict) -> dict:
     if atype == "battery":
         load_ratio  = abs(power) / max_d if max_d > 0 else 0
         temp_target = 25.0 + load_ratio * 15.0
-        temp        = round(_walk(s["temperature_celsius"] or 25.0, 0.5, 15.0, 55.0) + (temp_target - (s["temperature_celsius"] or 25.0)) * 0.05, 2)
+        temp        = round(_walk(s["temperature_celsius"] or 25.0, 1.5, 15.0, 55.0) + (temp_target - (s["temperature_celsius"] or 25.0)) * 0.05, 2)
     else:
         temp = None
 
     soc_pct          = round((energy / cap) * 100.0, 2) if atype == "battery" and cap > 0 else None
-    operational_mode = derive_operational_mode(atype, power, hour)
+
+    # 1-in-100 chance of fault
+    if random.randint(1, 100) == 1:
+        operational_mode = "fault"
+        asset_status     = "unreachable"
+    else:
+        operational_mode = derive_operational_mode(atype, power, hour)
+        asset_status     = "communicating"
 
     _state[aid] = {
         "energy_mwh":          energy,
@@ -182,7 +179,7 @@ def next_telemetry(asset: dict) -> dict:
         "energy_mwh":              energy,
         "power_mw":                power,
         "operational_mode":        operational_mode,
-        "asset_status": "unreachable" if random.randint(1, 100) == 1 else "communicating",
+        "asset_status":            asset_status,
         "reactive_power_mvar":     q_power,
         "power_factor":            pf,
         "voltage":                 voltage,
@@ -237,6 +234,7 @@ def run():
                     ok += 1
                 else:
                     fail += 1
+                time.sleep(0.1)  # avoid overwhelming the API thread pool
             log.info("Tick — %d posted, %d failed (of %d assets)", ok, fail, len(assets))
 
         elapsed = time.monotonic() - tick_start
