@@ -67,10 +67,10 @@ def wind_factor(hour: float) -> float:
 
 def derive_operational_mode(asset_type: str, power_mw: float, hour: float) -> str:
     if asset_type == "battery":
-        if power_mw < -0.5 or power_mw > 0.5:
+        if power_mw < -0.1 or power_mw > 0.1:
             return "active"
         else:
-            return "holding"
+            return "curtailed"
     elif asset_type == "solar":
         return "curtailed" if solar_factor(hour) < 0.05 else "active"
     else:  # wind
@@ -91,12 +91,12 @@ def _init_state(asset: dict) -> dict:
         power  = asset["max_discharge_rate_mw"] * battery_load_factor(hour) * random.uniform(0.8, 1.0)
     elif atype == "solar":
         sf     = solar_factor(hour)
-        energy = cap * sf * random.uniform(0.7, 1.0)
         power  = asset["max_discharge_rate_mw"] * sf * random.uniform(0.85, 1.0)
+        energy = 0.0  # solar has no storage
     else:  # wind
         wf     = wind_factor(hour)
-        energy = cap * wf * random.uniform(0.5, 0.9)
         power  = asset["max_discharge_rate_mw"] * wf * random.uniform(0.7, 1.0)
+        energy = 0.0  # wind has no storage
 
     return {
         "energy_mwh":          round(energy, 3),
@@ -138,8 +138,11 @@ def next_telemetry(asset: dict) -> dict:
         target = max_d * wind_factor(hour)
         power  = round(max(0.0, min(max_d, s["power_mw"] + (target - s["power_mw"]) * 0.1 + random.uniform(-max_d * 0.08, max_d * 0.08))), 3)
 
-    # Energy — derived from power over the interval
-    energy  = round(max(0.0, min(cap, s["energy_mwh"] - power * (INTERVAL_SEC / 3600.0))), 3)
+    # Energy — batteries only; solar and wind have no storage
+    if atype == "battery":
+        energy = round(max(0.0, min(cap, s["energy_mwh"] - power * (INTERVAL_SEC / 3600.0))), 3)
+    else:
+        energy = 0.0
 
     # Electrical
     voltage = _walk(s["voltage"], 1.5, 390.0, 415.0)
@@ -155,7 +158,8 @@ def next_telemetry(asset: dict) -> dict:
     else:
         temp = None
 
-    soc_pct          = round((energy / cap) * 100.0, 2) if atype == "battery" and cap > 0 else None
+    # SoC percent — batteries only, never sent for solar/wind
+    soc_pct = round((energy / cap) * 100.0, 2) if atype == "battery" and cap > 0 else None
 
     # 1-in-100 chance of fault
     if random.randint(1, 100) == 1:
@@ -175,19 +179,24 @@ def next_telemetry(asset: dict) -> dict:
     }
 
     payload = {
-        "timestamp":               now.isoformat(),
-        "energy_mwh":              energy,
-        "power_mw":                power,
-        "operational_mode":        operational_mode,
-        "asset_status":            asset_status,
-        "reactive_power_mvar":     q_power,
-        "power_factor":            pf,
-        "voltage":                 voltage,
-        "current_amps":            current,
-        "temperature_celsius":     temp,
-        "state_of_charge_percent": soc_pct,
+        "timestamp":           now.isoformat(),
+        "energy_mwh":          energy,
+        "power_mw":            power,
+        "operational_mode":    operational_mode,
+        "asset_status":        asset_status,
+        "reactive_power_mvar": q_power,
+        "power_factor":        pf,
+        "voltage":             voltage,
+        "current_amps":        current,
     }
-    return {k: v for k, v in payload.items() if v is not None}
+
+    # Only add optional fields when they have a meaningful value
+    if temp is not None:
+        payload["temperature_celsius"] = temp
+    if soc_pct is not None:
+        payload["state_of_charge_percent"] = soc_pct
+
+    return payload
 
 
 # ---------------------------------------------------------------------------

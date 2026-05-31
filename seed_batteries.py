@@ -186,7 +186,7 @@ def make_soc_records(asset: Asset) -> list:
             asset_status = AssetStatus.UNREACHABLE
         else:
             if abs(power_mw) < 0.01:
-                mode = GridConnectionStatus.HOLDING
+                mode = GridConnectionStatus.CURTAILED
             else:
                 mode = GridConnectionStatus.ACTIVE
             if asset.asset_type in (AssetType.SOLAR, AssetType.WIND):
@@ -197,11 +197,14 @@ def make_soc_records(asset: Asset) -> list:
 
         # Temperature — ambient drift + load correlation + noise (batteries only)
         if asset.asset_type == AssetType.BATTERY:
-            load_ratio  = abs(power_mw) / asset.max_discharge_rate_mw if asset.max_discharge_rate_mw > 0 else 0
-            base_temp   = 22.0 + 6.0 * math.sin(i * math.pi / (6 * 144))
+            load_ratio   = abs(power_mw) / asset.max_discharge_rate_mw if asset.max_discharge_rate_mw > 0 else 0
+            base_temp    = 22.0 + 6.0 * math.sin(i * math.pi / (6 * 144))
             temp_celsius = round(base_temp + load_ratio * 12.0 + random.uniform(-1.5, 1.5), 1)
         else:
             temp_celsius = None
+
+        # current_amps — abs() to avoid negative values from charging power_mw
+        current_amps = round(abs(power_mw) * 1000 / 1400, 2) if asset.asset_type == AssetType.BATTERY else None
 
         records.append(StateOfCharge(
             asset_id=asset.id,
@@ -210,7 +213,7 @@ def make_soc_records(asset: Asset) -> list:
             operational_mode=mode,
             energy_mwh=energy if asset.asset_type == AssetType.BATTERY else 0.0,
             voltage=round(random.uniform(1380.0, 1420.0), 1) if asset.asset_type == AssetType.BATTERY else None,
-            current_amps=round(power_mw * 1000 / 1400, 2) if asset.asset_type == AssetType.BATTERY else None,
+            current_amps=current_amps,
             temperature_celsius=temp_celsius,
             power_mw=power_mw,
             reactive_power_mvar=reactive_power_mvar,

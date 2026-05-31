@@ -106,11 +106,11 @@ def add_telemetry(asset_id: int, payload: TelemetryCreate, db: Session = Depends
     if not asset:
         raise HTTPException(status_code=404, detail=f"Asset {asset_id} not found")
 
-    if payload.state_of_charge_percent is not None and asset.asset_type != AssetType.BATTERY:
+    if payload.state_of_charge_percent is not None and payload.state_of_charge_percent != 0.0 and asset.asset_type != AssetType.BATTERY:
         raise HTTPException(
             status_code=422,
             detail="state_of_charge_percent is only valid for BATTERY assets"
-        )
+            )
 
     record = StateOfCharge(asset_id=asset_id, **payload.model_dump(exclude={"state_of_charge_percent"}))
     db.add(record)
