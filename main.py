@@ -1,17 +1,33 @@
+import os
+import threading
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Depends, Query, HTTPException
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import func, text
+from pydantic import BaseModel
 from typing import Optional
 from datetime import datetime, timedelta
 from math import ceil
 from database import engine, SessionLocal
 from models import Base, Asset, AssetType, StateOfCharge
 from llm_service import ask_grid_question_stream
+from telemetry_simulator import run as run_simulator
+
 
 Base.metadata.create_all(bind=engine)
-app = FastAPI(title="Grid Asset Manager API")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if os.getenv("TELEMETRY_SIMULATOR", "false").lower() == "true":
+        thread = threading.Thread(target=run_simulator, daemon=True, name="telemetry-simulator")
+        thread.start()
+    yield
+
+
+app = FastAPI(title="Grid Asset Manager API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -29,6 +45,33 @@ def get_db():
     finally:
         db.close()
 
+
+# --- Pydantic schemas ---
+
+class AssetCreate(BaseModel):
+    eic_code: str
+    name: str
+    asset_type: AssetType
+    max_capacity_mwh: float
+    max_charge_rate_mw: float
+    max_discharge_rate_mw: float
+    reactive_power_capacity_mvar: Optional[float] = None
+    efficiency: Optional[float] = None
+
+class TelemetryCreate(BaseModel):
+    timestamp: datetime
+    energy_mwh: float                               # required — not nullable in StateOfCharge
+    power_mw: float
+    reactive_power_mvar: Optional[float] = None
+    power_factor: Optional[float] = None
+    voltage: Optional[float] = None
+    current_amps: Optional[float] = None
+    temperature_celsius: Optional[float] = None
+    state_of_charge_percent: Optional[float] = None  # validated but not stored
+
+
+# --- Endpoints ---
+
 @app.get("/")
 def read_root():
     return {"message": "Asset Grid Manager API", "status": "running"}
@@ -36,6 +79,42 @@ def read_root():
 @app.get("/health")
 def health_check():
     return {"status": "healthy"}
+
+
+@app.post("/assets", status_code=201)
+def create_or_update_asset(payload: AssetCreate, db: Session = Depends(get_db)):
+    asset = db.query(Asset).filter(Asset.eic_code == payload.eic_code).first()
+    if asset:
+        for field, value in payload.model_dump(exclude={"eic_code"}).items():
+            setattr(asset, field, value)
+        db.commit()
+        db.refresh(asset)
+        return {"action": "updated", "asset_id": asset.id}
+    else:
+        asset = Asset(**payload.model_dump())
+        db.add(asset)
+        db.commit()
+        db.refresh(asset)
+        return {"action": "created", "asset_id": asset.id}
+
+
+@app.post("/assets/{asset_id}/telemetry", status_code=201)
+def add_telemetry(asset_id: int, payload: TelemetryCreate, db: Session = Depends(get_db)):
+    asset = db.query(Asset).filter(Asset.id == asset_id).first()
+    if not asset:
+        raise HTTPException(status_code=404, detail=f"Asset {asset_id} not found")
+
+    if payload.state_of_charge_percent is not None and asset.asset_type != AssetType.BATTERY:
+        raise HTTPException(
+            status_code=422,
+            detail="state_of_charge_percent is only valid for BATTERY assets"
+        )
+
+    record = StateOfCharge(asset_id=asset_id, **payload.model_dump(exclude={"state_of_charge_percent"}))
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+    return {"record_id": record.id, "asset_id": asset_id}
 
 
 @app.get("/assetslist")
@@ -153,7 +232,6 @@ def get_asset_soc(
     limit: int = Query(288, description="Max records in D mode — default 288 = 24hrs at 10min intervals"),
     db: Session = Depends(get_db)
 ):
-    # Verify asset exists
     asset = db.query(Asset).filter(Asset.id == asset_id).first()
 
     if not asset:
@@ -190,7 +268,6 @@ def get_asset_soc(
         }
 
     elif mode.upper() == "D":
-        # Default to last 2 days if no dates provided
         if not from_ts:
             from_dt = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=2)
         else:
@@ -201,7 +278,7 @@ def get_asset_soc(
         else:
             to_dt = datetime.fromisoformat(to_ts)
 
-        delta_days = (to_dt - from_dt).days
+        delta_days     = (to_dt - from_dt).days
         bucket_minutes = ceil((delta_days * 24 * 60) / limit)
 
         if delta_days <= 2:
