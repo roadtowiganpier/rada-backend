@@ -1,7 +1,8 @@
 import os
 import threading
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Depends, Query, HTTPException
+from fastapi import FastAPI, Depends, Query, HTTPException, Security
+from fastapi.security.api_key import APIKeyHeader
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
@@ -15,6 +16,15 @@ from models import Base, Asset, AssetType, StateOfCharge, GridConnectionStatus, 
 from llm_service import ask_grid_question_stream
 from telemetry_simulator import run as run_simulator
 
+# --- API Key authentication ---
+API_KEY = os.getenv("API_KEY")
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=True)
+
+def verify_api_key(api_key: str = Security(api_key_header)):
+    if api_key != API_KEY:
+        raise HTTPException(status_code=403, detail="Invalid or missing API key")
+
+
 
 Base.metadata.create_all(bind=engine)
 
@@ -27,7 +37,12 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="Grid Asset Manager API", lifespan=lifespan)
+app = FastAPI(
+    title="Grid Asset Manager API",
+    lifespan=lifespan,
+    docs_url="/docs" if os.getenv("ENVIRONMENT") == "development" else None,
+    redoc_url=None,
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -83,7 +98,7 @@ def health_check():
     return {"status": "healthy"}
 
 
-@app.post("/assets", status_code=201)
+@app.post("/assets", status_code=201, dependencies=[Depends(verify_api_key)])
 def create_or_update_asset(payload: AssetCreate, db: Session = Depends(get_db)):
     asset = db.query(Asset).filter(Asset.eic_code == payload.eic_code).first()
     if asset:
@@ -100,7 +115,7 @@ def create_or_update_asset(payload: AssetCreate, db: Session = Depends(get_db)):
         return {"action": "created", "asset_id": asset.id}
 
 
-@app.post("/assets/{asset_id}/telemetry", status_code=201)
+@app.post("/assets/{asset_id}/telemetry", status_code=201, dependencies=[Depends(verify_api_key)])
 def add_telemetry(asset_id: int, payload: TelemetryCreate, db: Session = Depends(get_db)):
     asset = db.query(Asset).filter(Asset.id == asset_id).first()
     if not asset:
@@ -119,7 +134,7 @@ def add_telemetry(asset_id: int, payload: TelemetryCreate, db: Session = Depends
     return {"record_id": record.id, "asset_id": asset_id}
 
 
-@app.get("/assetslist")
+@app.get("/assetslist", dependencies=[Depends(verify_api_key)])
 def get_assets(db: Session = Depends(get_db)):
 
     latest_soc = (
@@ -163,7 +178,7 @@ def get_assets(db: Session = Depends(get_db)):
     ]
 
 
-@app.get("/assets/summary")
+@app.get("/assets/summary", dependencies=[Depends(verify_api_key)])
 def get_asset_summary(db: Session = Depends(get_db)):
 
     latest_soc = (
@@ -218,7 +233,7 @@ def get_asset_summary(db: Session = Depends(get_db)):
     }
 
 
-@app.get("/assets/{asset_id}/soc")
+@app.get("/assets/{asset_id}/soc", dependencies=[Depends(verify_api_key)])
 def get_asset_soc(
     asset_id: int,
     mode: str = Query(..., description="S for summary (latest record), D for detail (history)"),
@@ -376,7 +391,7 @@ def get_asset_soc(
         raise HTTPException(status_code=400, detail="mode must be S (summary) or D (detail)")
 
 
-@app.post("/llm/ask")
+@app.post("/llm/ask", dependencies=[Depends(verify_api_key)])
 def ask_llm(question: str):
     return StreamingResponse(
         ask_grid_question_stream(question),
