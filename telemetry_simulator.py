@@ -23,6 +23,8 @@ log = logging.getLogger("simulator")
 
 API_BASE_URL  = os.getenv("API_BASE_URL", "http://localhost:8000")
 INTERVAL_SEC  = int(os.getenv("SIMULATOR_INTERVAL_SEC", 600))
+API_KEY       = os.getenv("API_KEY")
+HEADERS       = {"X-API-Key": API_KEY}
 
 # Per-asset state cache {asset_id: {field: last_value}}
 _state: dict[int, dict] = {}
@@ -205,7 +207,7 @@ def next_telemetry(asset: dict) -> dict:
 
 def _fetch_assets() -> list[dict]:
     try:
-        r = requests.get(f"{API_BASE_URL}/assetslist", timeout=10)
+        r = requests.get(f"{API_BASE_URL}/assetslist", headers=HEADERS, timeout=10)
         r.raise_for_status()
         return r.json()
     except Exception as e:
@@ -215,7 +217,7 @@ def _fetch_assets() -> list[dict]:
 
 def _post_telemetry(asset_id: int, payload: dict) -> bool:
     try:
-        r = requests.post(f"{API_BASE_URL}/assets/{asset_id}/telemetry", json=payload, timeout=10)
+        r = requests.post(f"{API_BASE_URL}/assets/{asset_id}/telemetry", headers=HEADERS, json=payload, timeout=10)
         r.raise_for_status()
         return True
     except Exception as e:
