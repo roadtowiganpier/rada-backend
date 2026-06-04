@@ -18,12 +18,13 @@ from telemetry_simulator import run as run_simulator
 
 # --- API Key authentication ---
 API_KEY = os.getenv("API_KEY")
-api_key_header = APIKeyHeader(name="X-API-Key", auto_error=True)
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 def verify_api_key(api_key: str = Security(api_key_header)):
+    if os.getenv("AUTH_ENABLED", "true").lower() == "false":
+        return
     if api_key != API_KEY:
         raise HTTPException(status_code=403, detail="Invalid or missing API key")
-
 
 
 Base.metadata.create_all(bind=engine)
