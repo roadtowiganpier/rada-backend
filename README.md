@@ -515,6 +515,16 @@ The frontend for this project is developed by [@Candyfair](https://github.com/Ca
 **[Candyfair/grid-asset-manager-frontend](https://github.com/Candyfair/grid-asset-manager-frontend)**
 
 
+## 12. Docker Update
+
+cd ~/grid-deploy
+git pull
+docker build --no-cache -t grid-api:latest .
+sudo docker compose -f /var/www/docker-compose.yml up -d grid-api
+
+to stop
+sudo docker compose -f /var/www/docker-compose.yml stop grid-api
+
 
 ---
 
