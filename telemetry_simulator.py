@@ -106,7 +106,7 @@ def _init_state(asset: dict) -> dict:
         "reactive_power_mvar": round(random.uniform(0.5, asset.get("reactive_power_capacity_mvar") or 5.0), 3),
         "power_factor":        round(random.uniform(0.97, 1.0), 4),
         "voltage":             round(random.uniform(395.0, 405.0), 2),
-        "temperature_celsius": round(random.uniform(20.0, 35.0), 1) if atype == "battery" else None,
+        "temperature_celsius": round(random.uniform(20.0, 35.0), 1) ,
     }
 
 
