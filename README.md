@@ -3,7 +3,9 @@
 *Grid-scale renewable energy asset monitoring and AI analytics platform*
 *(previously developed under the working name "BESS Grid Manager")*
 
-RADA is a grid-scale monitoring and analytics platform for renewable energy fleets — batteries (BESS), solar farms, and wind farms. It maintains a registry of assets identified by ENTSO-E EIC codes, ingests 10-minute telemetry into a PostgreSQL/TimescaleDB database, exposes a FastAPI REST API with adaptive time-series downsampling, and answers natural-language questions about the fleet via a locally-running LLM with live database access. The application is in production on a Hetzner VPS, with a Next.js frontend (built by [@Candyfair](https://github.com/Candyfair)) hosted on Vercel.
+RADA is a grid-scale monitoring and analytics platform for renewable energy fleets — batteries (BESS), solar farms, and wind farms. It maintains a registry of assets identified by ENTSO-E EIC codes, ingests 10-minute telemetry into a PostgreSQL/TimescaleDB database, exposes a FastAPI REST API with adaptive time-series downsampling, and answers natural-language questions about the fleet via a locally-running LLM with live database access. 
+
+This is built as the backend counterpart to the **[RADA frontend](https://github.com/candyfair/rada-frontend)** developed by [Candice Fairand](https://github.com/Candyfair).
 
 Units throughout are **MW** (power), **MWh** (energy), and **MVAr** (reactive power), consistent with grid-scale industry standards.
 
