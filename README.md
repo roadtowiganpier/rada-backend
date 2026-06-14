@@ -1,6 +1,11 @@
-# BESS Grid Manager
+# RADA — Renewable Assets Data Analytics
 
-A grid-scale renewable energy asset monitoring and AI analysis platform built with FastAPI, SQLAlchemy, and Mistral via Ollama. The application exposes a REST API for querying a fleet of batteries, solar farms, and wind turbines, and accepts natural language questions answered by a locally-running LLM with live access to the database.
+*Grid-scale renewable energy asset monitoring and AI analytics platform*
+*(previously developed under the working name "BESS Grid Manager")*
+
+RADA is a grid-scale monitoring and analytics platform for renewable energy fleets — batteries (BESS), solar farms, and wind farms. It maintains a registry of assets identified by ENTSO-E EIC codes, ingests 10-minute telemetry into a PostgreSQL/TimescaleDB database, exposes a FastAPI REST API with adaptive time-series downsampling, and answers natural-language questions about the fleet via a locally-running LLM with live database access. The application is in production on a Hetzner VPS, with a Next.js frontend (built by [@Candyfair](https://github.com/Candyfair)) hosted on Vercel.
+
+Units throughout are **MW** (power), **MWh** (energy), and **MVAr** (reactive power), consistent with grid-scale industry standards.
 
 ---
 
@@ -11,28 +16,58 @@ A grid-scale renewable energy asset monitoring and AI analysis platform built wi
 3. [File Structure](#3-file-structure)
 4. [Data Models](#4-data-models)
 5. [API Endpoints](#5-api-endpoints)
-6. [Setting Up the Virtual Environment](#6-setting-up-the-virtual-environment)
-7. [Connecting to Ollama and Mistral](#7-connecting-to-ollama-and-mistral)
-8. [Running the Application](#8-running-the-application)
-9. [Seeding the Database](#9-seeding-the-database)
-10. [Daily Development Workflow](#10-daily-development-workflow)
+6. [Authentication, Security & CORS](#6-authentication-security--cors)
+7. [Environment Configuration](#7-environment-configuration)
+8. [Local Development Setup](#8-local-development-setup)
+9. [Production Deployment](#9-production-deployment)
+10. [Seeding & the Telemetry Simulator](#10-seeding--the-telemetry-simulator)
+11. [LLM Integration — Current State & Roadmap](#11-llm-integration--current-state--roadmap)
+12. [Frontend](#12-frontend)
+13. [Key Architectural Decisions & Learnings](#13-key-architectural-decisions--learnings)
+14. [Roadmap — On the Horizon](#14-roadmap--on-the-horizon)
 
 ---
 
 ## 1. Project Overview
 
-The BESS Grid Manager provides:
+RADA provides:
 
-- A **SQLite database** (`grid_assets.db`) holding grid-scale asset data — batteries, solar farms, and wind turbines — created automatically on startup
-- **Time-series history** for State of Charge, telemetry, dispatch commands, and grid signals stored at 10-minute resolution over 30 days
-- A **FastAPI REST backend** for querying asset status and live operational data
-- A **Mistral LLM integration** via Ollama that answers natural language questions about the fleet by calling SQLAlchemy queries as tools
+- A **PostgreSQL database with the TimescaleDB extension**, holding grid-scale asset data — batteries, solar farms, and wind farms — with telemetry stored as time-series hypertables
+- **30 days of seeded historical telemetry** at 10-minute resolution, plus a **live telemetry simulator** that continues posting realistic readings every 10 minutes through the same API real assets would use
+- A **FastAPI REST backend** for querying asset reference data, current status, and historical telemetry, with **adaptive downsampling** for charting (raw 10-minute data for short ranges, `time_bucket()` aggregation for longer ones, capped at 250 points per response)
+- **API key authentication** (toggleable per environment) and CORS configured for the Next.js frontend
+- An **LLM integration** (currently Mistral via Ollama) that answers natural-language questions about the fleet by calling SQLAlchemy queries as tools — narrating live data rather than guessing from training
+- A **production deployment** on a Hetzner VPS behind Traefik with automatic Let's Encrypt SSL, with a Next.js frontend on Vercel
 
-Units throughout are **MW** (power) and **MWh** (energy), consistent with grid-scale industry standards.
+> **Note on naming:** the product is now branded **RADA**. The underlying repos, containers, and directories (`grid-deploy`, `grid-api`, `grid_assets.db` references, etc.) retain their original working names — this is normal and doesn't need to change for the rename to apply at the product level.
 
 ---
 
 ## 2. Architecture
+
+### Production deployment topology
+
+```mermaid
+graph TD
+    User([User / Browser])
+    FE["Next.js Frontend on Vercel, built by Candy"]
+    Traefik["Traefik - reverse proxy + Lets Encrypt SSL - api.candyfairstudio.com"]
+    API["grid-api container - FastAPI"]
+    DB["TimescaleDB container - /opt/database/"]
+    TS{Tailscale mesh}
+    Home["Home server (planned) - RTX 3090 - vLLM"]
+
+    User --> FE
+    FE -->|HTTPS, X-API-Key| Traefik
+    Traefik --> API
+    API --> DB
+    API -.->|future: LLM inference| TS
+    TS -.-> Home
+```
+
+The VPS runs Docker Compose (project name `www`, network `www_cb_network`) at `/var/www/docker-compose.yml`. TimescaleDB runs as a **separate container** at `/opt/database/`, decoupled from the API container's lifecycle.
+
+### Application-level architecture
 
 ```mermaid
 graph TB
@@ -40,11 +75,15 @@ graph TB
 
     subgraph Backend ["FastAPI App - main.py"]
         Root["GET /  -  Root info"]
-        Health["GET /health  -  Health check"]
-        AssetsList["GET /assetslist  -  All assets with latest SoC"]
+        Health["GET /health  -  Health check, no auth"]
+        AssetsList["GET /assetslist  -  All assets with latest reading"]
         Summary["GET /assets/summary  -  Fleet totals by type"]
-        SoC["GET /assets/id/soc  -  Single asset SoC history"]
-        LLM["POST /llm/ask  -  Ask Mistral"]
+        Detail["GET /assets/id/soc  -  Single asset history"]
+        LLM["POST /llm/ask  -  Ask the LLM"]
+    end
+
+    subgraph AuthLayer ["Auth - APIKeyHeader"]
+        APIKey["X-API-Key header, gated by AUTH_ENABLED"]
     end
 
     subgraph LLMLayer ["LLM Service - llm_service.py"]
@@ -54,26 +93,27 @@ graph TB
     end
 
     subgraph DB ["Database Layer"]
-        Database["database.py - SQLite engine and SessionLocal"]
+        Database["database.py - SQLAlchemy engine + SessionLocal - UTC timezone set on every connection"]
         Models["models.py - SQLAlchemy ORM Models"]
-        DBFile[("grid_assets.db - auto-created")]
+        TSDB[("PostgreSQL + TimescaleDB - hypertables for time-series data")]
     end
 
-    subgraph AI ["Local AI - Ollama"]
-        Mistral["mistral:7b-instruct"]
+    subgraph AI ["LLM Runtime"]
+        Mistral["mistral 7b-instruct via Ollama now, vLLM on home GPU server planned"]
     end
 
-    Client -->|HTTP| Root
-    Client -->|HTTP| Health
-    Client -->|HTTP| AssetsList
-    Client -->|HTTP| Summary
-    Client -->|HTTP| SoC
-    Client -->|HTTP Stream| LLM
+    Client -->|HTTP| APIKey
+    APIKey --> Root
+    APIKey --> AssetsList
+    APIKey --> Summary
+    APIKey --> Detail
+    APIKey --> LLM
+    Client -->|HTTP, no auth| Health
 
     AssetsList -->|get_db| Database
     Summary -->|get_db| Database
-    SoC -->|get_db| Database
-    Database --> DBFile
+    Detail -->|get_db| Database
+    Database --> TSDB
 
     LLM --> AskStream
     AskStream -->|1. First call with tools| Mistral
@@ -91,34 +131,43 @@ graph TB
 
 The `/llm/ask` endpoint uses a **two-pass pattern** in `llm_service.py`:
 
-1. Mistral receives the user's question along with a tool definition (`get_all_assets`). It decides whether a database lookup is needed.
-2. If it calls the tool, the service executes the corresponding SQLAlchemy query and sends the result back to Mistral.
-3. Mistral generates a final answer, which is **streamed token-by-token** back to the client via `StreamingResponse`.
+1. The model receives the user's question along with a tool definition (`get_all_assets`). It decides whether a database lookup is needed.
+2. If it calls the tool, the service executes the corresponding SQLAlchemy query and sends the result back to the model.
+3. The model generates a final answer, streamed token-by-token back to the client via `StreamingResponse`.
 
-This means Mistral narrates results from live data rather than guessing from training — important for accurate capacity and energy figures.
+This means the LLM **narrates results from live data rather than guessing from training** — see [§13](#13-key-architectural-decisions--learnings) for why this matters.
 
 ---
 
 ## 3. File Structure
 
 ```
-bess-grid-management/
+grid-deploy/
 │
-├── main.py              # FastAPI app — routes and dependency injection
-├── database.py          # SQLite engine, SessionLocal, Base, get_db()
-├── models.py            # All SQLAlchemy ORM models
-├── llm_service.py       # Mistral tool-calling and streaming logic
-├── seed_data.py         # Populates 30 days of historical data
-├── grid_assets.db       # SQLite database file (auto-created on startup)
-├── requirements.txt     # Python dependencies
-└── venv/                # Virtual environment (not committed to git)
+├── main.py              # FastAPI app — routes, CORS, dependency injection
+├── database.py          # PostgreSQL/TimescaleDB engine, SessionLocal, Base, get_db()
+│                         #   — sets UTC timezone on every connection
+├── models.py             # All SQLAlchemy ORM models
+├── auth.py               # APIKeyHeader dependency, AUTH_ENABLED toggle
+├── llm_service.py        # Mistral/vLLM tool-calling and streaming logic
+├── simulator.py          # Telemetry simulator (SIMULATOR_INTERVAL_SEC)
+├── seed_batteries.py      # Seeds 30 days of historical data (run inside container)
+├── seed_solar.py
+├── seed_wind.py
+├── .env                  # Local environment config (AUTH_ENABLED=false)
+├── .env.production        # VPS environment config (AUTH_ENABLED=true)
+├── Dockerfile
+├── requirements.txt
+└── venv/                  # Virtual environment (not committed to git)
 ```
+
+> ⚠️ **Check against current code:** the database/auth/simulator layer has changed significantly since this README was first written (SQLite → PostgreSQL/TimescaleDB, plus auth and CORS additions). The filenames above reflect the architecture described in our working notes — confirm exact filenames against the current `grid-deploy` repo and adjust if they've diverged.
 
 ---
 
 ## 4. Data Models
 
-There are four tables. `Asset` is the master record; `StateOfCharge` and `DispatchCommand` are the time-series child tables linked by foreign key. `GridSignal` is standalone — it captures grid-level conditions with no link to individual assets.
+Asset reference data and time-series telemetry are split as before, but time-series tables now live in **TimescaleDB hypertables** for efficient range queries and downsampling.
 
 ### Entity Relationship Diagram
 
@@ -127,30 +176,30 @@ erDiagram
     Asset {
         int id PK
         string asset_type
-        string eic_code
+        string eic_code "16-char ENTSO-E EIC code, unique, nullable"
         string name
-        float max_charge_rate_mw
-        float max_discharge_rate_mw
+        float max_power_rate_mw
+        float max_charge_rate_mw "batteries only"
+        float max_capacity_mwh "batteries only"
         float reactive_power_capacity_mvar
-        float max_capacity_mwh
         float efficiency
         datetime created_at
         datetime updated_at
     }
 
-    StateOfCharge {
+    Telemetry {
         int id PK
         int asset_id FK
-        datetime timestamp
+        datetime timestamp "UTC, TimescaleDB hypertable key"
         string operational_mode
         string asset_status
-        float energy_mwh
+        float power_mw "sign encodes charge/discharge"
+        float energy_mwh "batteries only"
+        float reactive_power_mvar
+        float power_factor
         float voltage
         float current_amps
         float temperature_celsius
-        float power_mw
-        float reactive_power_mvar
-        float power_factor
     }
 
     DispatchCommand {
@@ -165,7 +214,7 @@ erDiagram
 
     GridSignal {
         int id PK
-        datetime timestamp
+        datetime timestamp "UTC, TimescaleDB hypertable key"
         float total_generation_mw
         float renewable_mw
         float renewable_pct
@@ -176,30 +225,30 @@ erDiagram
         string status
     }
 
-    Asset ||--o{ StateOfCharge : "has many"
+    Asset ||--o{ Telemetry : "has many"
     Asset ||--o{ DispatchCommand : "has many"
 ```
 
 ### Enums
 
-**AssetType** — the type of generation or storage asset:
+**AssetType**
 
 | Value | Description |
 |---|---|
 | `battery` | Battery energy storage system (BESS) |
 | `solar` | Solar photovoltaic farm |
-| `wind` | Wind turbine or wind farm |
+| `wind` | Wind farm |
 
-**GridConnectionStatus** — the operational mode recorded in `StateOfCharge.operational_mode`:
+**GridConnectionStatus** (`Telemetry.operational_mode`)
 
 | Value | Description |
 |---|---|
-| `active` | Operating normally — charge or discharge direction read from `power_mw` sign |
+| `active` | Operating normally — charge/discharge direction read from sign of `power_mw` |
 | `curtailed` | Output restricted by grid operator instruction |
 | `holding` | Standing by, reserved for frequency response |
 | `fault` | Asset is in a fault state |
 
-**AssetStatus** — the communications state recorded in `StateOfCharge.asset_status`:
+**AssetStatus** (`Telemetry.asset_status`)
 
 | Value | Description |
 |---|---|
@@ -208,29 +257,44 @@ erDiagram
 
 ### Key design decisions
 
-- **No separate telemetry table.** Voltage, current, and temperature readings are columns on `StateOfCharge`, keeping all per-asset time-series data in one place. The current value for any field is always the most recent row by timestamp.
-- **`GridSignal` is standalone.** It has no foreign key to `Asset` — it captures grid-level conditions (generation mix, imbalance, FCR activation) that apply to the whole network, not a single asset. The `calculated_frequency_hz` field is derived from imbalance data, not a real instrument measurement.
-- **`eic_code` is ENTSO-E standard.** Exactly 16 characters, unique per asset. Nullable to support assets that have not yet been registered.
-- **`power_mw` sign convention.** A positive value means the asset is importing (charging); a negative value means it is exporting (discharging). Direction is not stored as a separate column.
+- **Asset = metering point = dispatch unit.** A solar or wind farm is modelled as a single asset at one grid connection point — aligned with how RTE/ENTSO-E metering works.
+- **`eic_code` is the canonical identifier**, supporting both GB (Elexon BMU) and French/European (RTE) market contexts. Exactly 16 characters, unique, nullable for unregistered assets.
+- **`power_mw` sign convention.** Positive = exporting to the grid (discharging/generating); negative = importing (charging). Direction is not stored as a separate column.
+- **Timestamps are always UTC.** `database.py` sets `SET TIME ZONE 'UTC'` on every connection via a SQLAlchemy connect event. The frontend converts to `Europe/Paris` for display.
+- **Schema enrichment deferred.** Additional fields (`ambient_temperature_c`, `panel_temperature_c`, `irradiance_w_m2`, `cell_temperature_c`) are planned but deferred until the frontend has UI to render them.
 
 ---
 
 ## 5. API Endpoints
 
-| Method | Endpoint | Description |
-|---|---|---|
-| `GET` | `/` | Returns API name and running status |
-| `GET` | `/health` | Health check — returns `healthy` |
-| `GET` | `/assetslist` | All assets with latest `StateOfCharge` row joined |
-| `GET` | `/assets/summary` | Fleet-wide power and energy totals, broken down by asset type |
-| `GET` | `/assets/{asset_id}/soc` | Single asset SoC — latest record (`mode=S`) or history (`mode=D`) |
-| `POST` | `/llm/ask?question=...` | Streams a Mistral answer using live DB tool calling |
+| Method | Endpoint | Auth required? | Description |
+|---|---|---|---|
+| `GET` | `/` | Yes (if `AUTH_ENABLED`) | API name and running status |
+| `GET` | `/health` | **No, always open** | Health check, returns `healthy` |
+| `GET` | `/assetslist` | Yes | All assets with their latest telemetry row joined |
+| `GET` | `/assets/summary` | Yes | Fleet-wide totals, broken down by asset type |
+| `GET` | `/assets/{asset_id}/soc` | Yes | Single asset — latest record (`mode=S`) or history (`mode=D`) |
+| `POST` | `/llm/ask?question=...` | Yes | Streams an LLM answer using live DB tool calling |
+
+> **Route ordering matters:** `/assets/summary` must be declared **before** `/assets/{asset_id}` in `main.py`, otherwise FastAPI matches `summary` as a path parameter and the summary endpoint becomes unreachable.
+
+All authenticated requests must include:
+
+```
+X-API-Key: <API_KEY>
+```
+
+When `AUTH_ENABLED=false` (local development), this header is ignored.
 
 ---
 
 ### `GET /assetslist`
 
-Returns all assets (batteries, solar, wind) with their latest `StateOfCharge` row joined. No asset type filter is applied.
+```bash
+curl -H "X-API-Key: $API_KEY" "https://api.candyfairstudio.com/assetslist"
+```
+
+Returns all assets (batteries, solar, wind) with their latest telemetry row joined. No asset type filter is applied.
 
 ```json
 [
@@ -241,17 +305,16 @@ Returns all assets (batteries, solar, wind) with their latest `StateOfCharge` ro
     "name": "Fluence Gridstack Alpha",
     "max_capacity_mwh": 120.0,
     "max_charge_rate_mw": 60.0,
-    "max_discharge_rate_mw": 60.0,
+    "max_power_rate_mw": 60.0,
     "reactive_power_capacity_mvar": 12.0,
     "efficiency": 0.92,
-    "soc_id": 4320,
+    "timestamp": "2026-04-30T14:30:00Z",
     "operational_mode": "active",
     "asset_status": "communicating",
     "energy_mwh": 87.4,
     "power_mw": -45.2,
     "reactive_power_mvar": 3.1,
-    "power_factor": 0.998,
-    "last_updated": "2026-04-30T14:30:00"
+    "power_factor": 0.998
   }
 ]
 ```
@@ -260,7 +323,11 @@ Returns all assets (batteries, solar, wind) with their latest `StateOfCharge` ro
 
 ### `GET /assets/summary`
 
-Returns fleet-wide aggregated totals from the latest `StateOfCharge` row for each asset, broken down by asset type.
+```bash
+curl -H "X-API-Key: $API_KEY" "https://api.candyfairstudio.com/assets/summary"
+```
+
+Returns fleet-wide aggregated totals from the latest telemetry row for each asset, broken down by asset type.
 
 ```json
 {
@@ -280,62 +347,36 @@ Returns fleet-wide aggregated totals from the latest `StateOfCharge` row for eac
 
 ### `GET /assets/{asset_id}/soc`
 
-Returns state of charge data for a single asset. Behaviour is controlled by the `mode` query parameter.
-
 | Parameter | Required | Description |
 |---|---|---|
 | `mode` | Yes | `S` — latest record only; `D` — historical records |
-| `from_ts` | No | ISO datetime lower bound, e.g. `2026-04-25T00:00:00` (D mode only) |
-| `to_ts` | No | ISO datetime upper bound, e.g. `2026-05-02T23:59:59` (D mode only) |
-| `limit` | No | Max records returned in D mode — default `288` (24 hrs at 10-min intervals) |
+| `from_ts` | No | ISO datetime lower bound (D mode only) |
+| `to_ts` | No | ISO datetime upper bound (D mode only) |
+| `limit` | No | Max points returned in D mode — default `288` (24 hrs at 10-min intervals), **capped at 250 for chart ranges** |
 
 **`mode=S` — latest record:**
 
 ```bash
-GET /assets/1/soc?mode=S
+curl -H "X-API-Key: $API_KEY" "https://api.candyfairstudio.com/assets/1/soc?mode=S"
 ```
 
-```json
-{
-  "asset_id": 1,
-  "asset_name": "Fluence Gridstack Alpha",
-  "eic_code": "17W-0000-0000-0-A",
-  "asset_type": "battery",
-  "max_capacity_mwh": 120.0,
-  "record": {
-    "timestamp": "2026-04-30T14:30:00",
-    "operational_mode": "active",
-    "asset_status": "communicating",
-    "energy_mwh": 87.4,
-    "power_mw": -45.2,
-    "reactive_power_mvar": 3.1,
-    "power_factor": 0.998,
-    "voltage": 415.2,
-    "current_amps": -108.9,
-    "temperature_celsius": 28.4
-  }
-}
-```
-
-**`mode=D` — history with optional date range:**
+**`mode=D` — history with adaptive downsampling:**
 
 ```bash
-GET /assets/1/soc?mode=D&from_ts=2026-04-29T00:00:00&to_ts=2026-04-29T23:59:59
+curl -H "X-API-Key: $API_KEY" \
+  "https://api.candyfairstudio.com/assets/1/soc?mode=D&from_ts=2026-04-29T00:00:00&to_ts=2026-05-29T23:59:59"
 ```
 
-```json
-{
-  "asset_id": 1,
-  "asset_name": "Fluence Gridstack Alpha",
-  "eic_code": "17W-0000-0000-0-A",
-  "asset_type": "battery",
-  "max_capacity_mwh": 120.0,
-  "record_count": 144,
-  "from_ts": "2026-04-29T00:00:00",
-  "to_ts": "2026-04-29T23:50:00",
-  "records": [ { "..." : "..." } ]
-}
+Downsampling rule:
+
+- Ranges **≤ 2 days** return raw 10-minute records.
+- Longer ranges use TimescaleDB's `time_bucket()`, with bucket size calculated as:
+
+```python
+bucket_minutes = ceil((delta_days * 24 * 60) / limit)
 ```
+
+This keeps chart responses fast and bounded (max 250 points) while allowing drill-down to raw readings for short windows.
 
 Returns `404` if the asset does not exist or has no records. Returns `400` if `mode` is not `S` or `D`, or if a timestamp parameter is not valid ISO format.
 
@@ -344,25 +385,58 @@ Returns `404` if the asset does not exist or has no records. Returns `400` if `m
 ### `POST /llm/ask?question=...`
 
 ```bash
-curl -X POST "http://127.0.0.1:8000/llm/ask?question=Which+assets+are+currently+curtailed"
+curl -X POST -H "X-API-Key: $API_KEY" \
+  "https://api.candyfairstudio.com/llm/ask?question=Which+assets+are+currently+curtailed"
 ```
 
-Streams a plain-text response token by token via `StreamingResponse`. Mistral receives the question, decides whether to call the `get_all_assets` tool, executes the live SQLAlchemy query if needed, then generates a grounded answer from real data.
+Streams a plain-text response token by token via `StreamingResponse`.
 
 ---
 
-## 6. Setting Up the Virtual Environment
+## 6. Authentication, Security & CORS
 
-The virtual environment is already created. Activate it before each development session.
+- **API key auth** via `APIKeyHeader` (`X-API-Key`). Gated by the `AUTH_ENABLED` environment variable:
+  - `false` locally (`.env`) — no key required during development
+  - `true` on the VPS (`.env.production`) — all routes except `/health` require a valid key
+- **`/health` is always open**, regardless of `AUTH_ENABLED` — used for container health checks and uptime monitoring.
+- **Swagger docs (`/docs`)** are disabled in production via the `ENVIRONMENT` variable, to avoid exposing the schema and a live "try it out" console publicly.
+- **CORS** is configured via `CORSMiddleware` in `main.py` (added after app instantiation). Locally, `allow_origins` includes `http://localhost:3000`. For production, `allow_origins` must include the frontend's Vercel domain — this needs to be kept in sync whenever the frontend deployment URL changes.
+- All internal calls (e.g. the telemetry simulator posting to the API) authenticate the same way as external clients, using `HEADERS = {"X-API-Key": API_KEY}`.
 
-### Activate
+---
 
-**Linux / macOS (ThinkPad T490):**
+## 7. Environment Configuration
+
+Two environment files, loaded via `python-dotenv`:
+
+| File | Used by | Purpose |
+|---|---|---|
+| `.env` | Local development (T490) | `AUTH_ENABLED=false`, local DB connection string, `ENVIRONMENT=development` |
+| `.env.production` | VPS (`/var/www/`) | `AUTH_ENABLED=true`, production DB connection string, `ENVIRONMENT=production`, `SIMULATOR_INTERVAL_SEC`, `API_KEY` |
+
+Key variables:
+
+| Variable | Purpose |
+|---|---|
+| `DATABASE_URL` | PostgreSQL/TimescaleDB connection string |
+| `API_KEY` | Shared secret for `X-API-Key` header |
+| `AUTH_ENABLED` | Toggles auth enforcement |
+| `ENVIRONMENT` | `development` / `production` — controls Swagger docs visibility |
+| `SIMULATOR_INTERVAL_SEC` | Interval (seconds) between simulated telemetry posts |
+| RTE OAuth2 credentials | Stored server-side for Actual Generation / Balancing Energy API calls |
+
+`.gitignore` excludes both `.env` files and any credentials.
+
+---
+
+## 8. Local Development Setup
+
+### Activate the virtual environment
+
+**Linux (T490, Kali Linux):**
 ```bash
 source venv/bin/activate
 ```
-
-You will see `(venv)` at the start of your terminal prompt when active.
 
 ### Install or update dependencies
 
@@ -370,162 +444,167 @@ You will see `(venv)` at the start of your terminal prompt when active.
 pip install -r requirements.txt
 ```
 
-Core packages installed:
-
 | Package | Purpose |
 |---|---|
 | `fastapi` | Web framework and REST API |
-| `uvicorn` | ASGI server to run FastAPI |
-| `sqlalchemy` | ORM — all models and DB sessions |
-| `ollama` | Python client for Ollama (`ollama.chat`) |
+| `uvicorn` | ASGI server |
+| `sqlalchemy` | ORM — models and DB sessions |
+| `psycopg2` / `asyncpg` | PostgreSQL driver |
+| `ollama` | Python client for local LLM (`ollama.chat`) |
 | `python-dotenv` | Load environment variables from `.env` |
 
-### Deactivate
-
-```bash
-deactivate
-```
-
----
-
-## 7. Connecting to Ollama and Mistral
-
-### Install Ollama (one-time)
-
-```bash
-# Linux
-curl -fsSL https://ollama.com/install.sh | sh
-```
-
-### Pull the correct model
-
-```bash
-ollama pull mistral:7b-instruct
-```
-
-> **Important:** Use `mistral:7b-instruct`, not `mistral:7b-instruct-q8_0`. The quantised `q8_0` variant does not support tool calling and will return HTTP 400 errors on the `/llm/ask` endpoint.
-
-Confirm the model is available:
-
-```bash
-ollama list
-# Should show: mistral:7b-instruct
-```
-
-### Start the Ollama server
-
-Ollama must be running in a **separate terminal** before starting FastAPI:
-
-```bash
-ollama serve
-```
-
-Ollama runs at `http://localhost:11434` by default. `llm_service.py` connects here via `ollama.chat()`.
-
-### Switching models
-
-To use a different model, edit the model name in `llm_service.py`:
-
-```python
-model = "mistral:7b-instruct"   # Change this line
-```
-
-Then pull the new model with `ollama pull <model-name>` and restart FastAPI.
-
-### Performance note
-
-On CPU-only hardware, expect approximately 60–75 seconds time-to-first-token for a cold Mistral model, dropping to ~20–30 seconds when the model is warm (cached in memory). Once the RTX 3090 home server is online, inference time is expected to fall below 10 seconds.
-
----
-
-## 8. Running the Application
-
-### Prerequisites
-
-- [ ] Virtual environment activated (`source venv/bin/activate`)
-- [ ] Ollama running in a separate terminal (`ollama serve`)
-- [ ] `mistral:7b-instruct` pulled (`ollama list`)
-
-### Start the server
+### Run the API locally
 
 ```bash
 uvicorn main:app --reload
 ```
 
-The `--reload` flag restarts the server automatically on code changes.
-
-`grid_assets.db` is created automatically on first run if it does not exist. No manual database initialisation step is needed.
-
-### Access the interactive API docs
+With `AUTH_ENABLED=false`, all endpoints can be called without a key. Swagger docs are available at:
 
 ```
 http://127.0.0.1:8000/docs
 ```
 
-The Swagger UI lets you test all endpoints directly in the browser without needing a separate client.
-
 ---
 
-## 9. Seeding the Database
+## 9. Production Deployment
 
-The seed script populates 30 days of realistic historical data at 10-minute resolution.
+The VPS (Hetzner CAX11, **ARM64**, Ubuntu) runs Docker Compose at `/var/www/docker-compose.yml` (project name `www`, network `www_cb_network`). TimescaleDB runs in its **own container** at `/opt/database/`, separate from the API container.
 
-### What gets created
-
-| Table | Records |
-|---|---|
-| `assets` | 48 total — 30 batteries, 9 solar farms, 9 wind turbines |
-| `state_of_charge` | ~4,320 per asset (every 10 min × 30 days) |
-| `asset_telemetry` | ~4,320 per asset |
-| `dispatch_commands` | 1–3 per day per asset (~60 per asset) |
-| `grid_signals` | ~8,640 (every 5 min × 30 days) |
-
-### Run the seed
-
-Delete any existing database first (schema changes require a clean rebuild):
+### Standard deploy sequence
 
 ```bash
-rm grid_assets.db
-python seed_data.py
+cd ~/grid-deploy && git pull && \
+  docker build --no-cache -t grid-api:latest . && \
+  sudo docker compose -f /var/www/docker-compose.yml up -d grid-api
 ```
 
-### Data profiles
+To stop the API container:
 
-- **Battery SoC** starts at 60–85% of capacity and respects a 15% discharge floor — realistic for protecting battery chemistry
-- **Solar** generation follows a daylight bell curve; `state_of_charge_percent` is `None` (not applicable)
-- **Wind** follows a sinusoidal pattern with random variation
-- **Grid signals** include frequency, voltage, demand, and renewable percentage
+```bash
+sudo docker compose -f /var/www/docker-compose.yml stop grid-api
+```
+
+> **ARM64 vs amd64:** the VPS is ARM64. Docker images must be **built natively on the VPS** — images built on the T490 (amd64) cannot be transferred. `docker build --no-cache` is the established pattern to avoid stale layer caching on rebuild.
+
+### Seeding in production
+
+Seed scripts run **inside** the running container:
+
+```bash
+docker exec grid_api python seed_batteries.py
+```
+
+### Traefik & SSL
+
+Traefik handles all HTTPS termination and Let's Encrypt certificates for `api.candyfairstudio.com` automatically — certificates are never managed manually.
+
+### Tailscale / DNS note
+
+Tailscale can take over `/etc/resolv.conf` on the VPS, breaking Docker's DNS resolution for public domains (e.g. pulling base images, reaching `pypi.org`). Fix: set Docker's `daemon.json` to use `8.8.8.8` as a DNS server.
 
 ---
 
-## 10. Daily Development Workflow
+## 10. Seeding & the Telemetry Simulator
 
-```mermaid
-flowchart LR
-    A["1. Activate venv"] --> B["2. Start Ollama\nollama serve"]
-    B --> C["3. Start FastAPI\nuvicorn main:app --reload"]
-    C --> D["4. Open Swagger\nlocalhost:8000/docs"]
+### Seeding
+
+The seed scripts populate **30 days of realistic historical data at 10-minute resolution** across the fleet:
+
+| Profile | Behaviour |
+|---|---|
+| **Battery** | State of charge starts at 60–85% of capacity and respects a 15% discharge floor — realistic for protecting battery chemistry |
+| **Solar** | Generation follows a daylight bell curve; storage fields are `None` (not applicable) |
+| **Wind** | Sinusoidal pattern with random variation |
+| **Grid signals** | Frequency, voltage, demand, and renewable percentage, recorded every 5 minutes |
+
+### Telemetry simulator
+
+After seeding, the simulator keeps the dataset "live":
+
+- Runs on a configurable interval (`SIMULATOR_INTERVAL_SEC`)
+- Posts new readings for every asset via **authenticated internal HTTP calls** to the same API real assets would use:
+
+```python
+HEADERS = {"X-API-Key": API_KEY}
 ```
 
-## 11. Front End Application
+This means the frontend and LLM always see data arriving through the real ingestion path — there is no separate "simulation" code path in the API itself.
 
+---
 
-The frontend for this project is developed by [@Candyfair](https://github.com/Candyfair) and lives in a separate repository:
+## 11. LLM Integration — Current State & Roadmap
+
+### Current: Ollama + Mistral (local)
+
+```bash
+# One-time install
+curl -fsSL https://ollama.com/install.sh | sh
+
+# Pull the correct model
+ollama pull mistral:7b-instruct
+```
+
+> **Important:** use `mistral:7b-instruct`, not `mistral:7b-instruct-q8_0`. The quantised `q8_0` variant does not support tool calling and returns HTTP 400 on `/llm/ask`.
+
+Start Ollama in a separate terminal before FastAPI:
+
+```bash
+ollama serve   # http://localhost:11434
+```
+
+**Performance (CPU-only, T490):** ~60–75s time-to-first-token cold, ~20–30s warm.
+
+### Planned: vLLM on a dedicated home GPU server
+
+- An RTX 3090 (24GB VRAM) home server has been chosen to run inference, with **vLLM** selected over Ollama for its OpenAI-compatible API and significantly better time-to-first-token on a 24GB GPU.
+- Integration is designed to be a small change: point the `openai` SDK at vLLM's `base_url` in `llm_service.py`, rather than rewriting the tool-calling logic.
+- **Network routing:** the home server joins the existing Tailscale mesh; Traefik on the VPS proxies inference requests through the tunnel to vLLM. This keeps GPU workloads entirely off the VPS's 4GB RAM.
+- This component is **not yet active in production** — pending home server setup.
+
+---
+
+## 12. Frontend
+
+The frontend is developed by [@Candyfair](https://github.com/Candyfair) (Candy) as a separate Next.js application, hosted on Vercel:
 
 **[Candyfair/grid-asset-manager-frontend](https://github.com/Candyfair/grid-asset-manager-frontend)**
 
+Frontend responsibilities include:
 
-## 12. Docker Update
+- Fleet-wide **bubble chart** on login — bubble size reflects current charge/discharge relative to the fleet, bubble colour indicates telemetry health, with a fleet total for the selected asset type
+- Filtering by asset type
+- Asset detail view — current metrics, plus charting any metric over a user-defined time window, with multi-asset comparison
+- Light and dark mode
+- Converting UTC timestamps from the API to `Europe/Paris` for display
 
-cd ~/grid-deploy
-git pull
-docker build --no-cache -t grid-api:latest .
-sudo docker compose -f /var/www/docker-compose.yml up -d grid-api
-
-to stop
-sudo docker compose -f /var/www/docker-compose.yml stop grid-api
-
+Frontend documentation is maintained separately by Candy, with cross-references back to this backend README where relevant.
 
 ---
 
-*BESS Grid Manager · FastAPI · SQLAlchemy · SQLite · Mistral · Ollama · Python*
+## 13. Key Architectural Decisions & Learnings
+
+- **LLMs narrate, Python computes.** A 3,836 kWh discrepancy was observed when Mistral performed arithmetic directly on production data. All numerical computation happens in dedicated SQLAlchemy/Python functions; the LLM selects and narrates results only.
+- **Asset = metering point = dispatch unit.** A solar or wind farm is one asset at one grid connection point — standard practice aligned with RTE/ENTSO-E metering.
+- **EIC codes as canonical identifiers**, supporting both GB (Elexon BMU) and French/European (RTE) contexts.
+- **Adaptive downsampling.** Ranges ≤ 2 days return raw 10-minute records; longer ranges use `time_bucket()` with `bucket_minutes = ceil((delta_days * 24 * 60) / limit)`.
+- **Charge/discharge direction is encoded in the sign of `power_mw`**, not a separate enum.
+- **ARM64 vs amd64.** The VPS is ARM64 — Docker images must be built natively on it.
+- **Tailscale/DNS conflict.** Tailscale can hijack `/etc/resolv.conf`; fix via `daemon.json` with `8.8.8.8`.
+- **FastAPI route ordering.** More specific routes (`/assets/summary`) must be declared before parameterised routes (`/assets/{asset_id}`).
+- **vLLM over Ollama** for production inference, once GPU hardware is available — OpenAI-compatible API and much lower time-to-first-token on 24GB VRAM.
+
+---
+
+## 14. Roadmap — On the Horizon
+
+- [ ] **vLLM inference on the home server** — RTX 3090, integrated via the `openai` SDK pointed at vLLM's `base_url`
+- [ ] **Tailscale routing for LLM traffic** — Traefik on the VPS proxying through the tailnet to vLLM on the home server
+- [ ] **GitHub Actions CI/CD** — automatic deploy on push (not yet implemented)
+- [ ] **Architecture & installation documentation** — DB and backend as separate containers; frontend docs handled separately by Candy
+- [ ] **Schema enrichment** — `ambient_temperature_c`, `panel_temperature_c`, `irradiance_w_m2`, `cell_temperature_c`, deferred until the frontend can render them
+- [ ] **Headscale** — self-hosted Tailscale coordination server, deployable on the existing VPS once the stack is stable
+
+---
+
+*RADA · FastAPI · SQLAlchemy · PostgreSQL + TimescaleDB · Mistral/Ollama (-> vLLM) · Docker · Traefik · Next.js · Python*
