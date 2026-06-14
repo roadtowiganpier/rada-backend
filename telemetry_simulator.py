@@ -152,13 +152,16 @@ def next_telemetry(asset: dict) -> dict:
     q_power = _walk(s["reactive_power_mvar"], 0.3, 0.0, max_q)
     pf      = _walk(s["power_factor"], 0.005, 0.95, 1.0)
 
-    # Temperature (batteries only) — rises under load
+    # Temperature — rises with load (battery) or with sun/wind exposure
     if atype == "battery":
         load_ratio  = abs(power) / max_d if max_d > 0 else 0
         temp_target = 25.0 + load_ratio * 15.0
-        temp        = round(_walk(s["temperature_celsius"] or 25.0, 1.5, 15.0, 55.0) + (temp_target - (s["temperature_celsius"] or 25.0)) * 0.05, 2)
-    else:
-        temp = None
+    elif atype == "solar":
+        temp_target = 20.0 + solar_factor(hour) * 25.0   # panels run well above ambient under full sun
+    else:  # wind
+        temp_target = 15.0 + wind_factor(hour) * 5.0     # nacelle temp, mostly ambient with mild load coupling
+
+    temp = round(_walk(s["temperature_celsius"] or 25.0, 1.5, 15.0, 55.0) + (temp_target - (s["temperature_celsius"] or 25.0)) * 0.05, 2)
 
     # SoC percent — batteries only, never sent for solar/wind
     soc_pct = round((energy / cap) * 100.0, 2) if atype == "battery" and cap > 0 else None
